@@ -1,0 +1,46 @@
+# Build directories
+build/
+build-*/
+*build/
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Generated files
+*.inc
+*.h.inc
+*.cpp.inc
+*.td.inc
+*.so
+*.a
+*.dylib
+*.dll
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# LLVM/MLIR specific
+*.bc
+*.ll
+*.opt
+
+# Test outputs
+*.out
