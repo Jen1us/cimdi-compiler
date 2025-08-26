@@ -77,22 +77,225 @@ public:
     if (!elementType.isInteger(8) && !elementType.isInteger(4))
       return mlir::failure();
     
-    // 成功匹配！创建SA原生量化矩阵乘法操作
+    // 成功匹配！检查是否需要tiling
     mlir::Value activation = matmulOp.getInputs()[0];
     
-    rewriter.replaceOpWithNewOp<mlir::cimdi::CimdiCIMSAMatmulOp>(
-        matmulOp,
-        matmulOp.getResult(0).getType(),
-        activation,       // FP16激活 
-        quantizedWeight,  // 原始量化权重
-        scaleValue,       // 缩放因子
-        zeroPointValue    // 零点
-    );
+    // 获取矩阵维度以决定是否需要tiling
+    auto outputType = mlir::dyn_cast<mlir::RankedTensorType>(matmulOp.getResult(0).getType());
+    if (!outputType || outputType.getShape().size() != 2) {
+      return mlir::failure();
+    }
 
-    return mlir::success();
+    auto shape = outputType.getShape();
+    int64_t M = shape[0], N = shape[1];
+    
+    // 获取 K 维度
+    auto inputAType = mlir::dyn_cast<mlir::RankedTensorType>(activation.getType());
+    if (!inputAType) return mlir::failure();
+    int64_t K = inputAType.getShape()[1];
+
+    // 如果矩阵足够小，直接转换
+    if (M <= 128 && N <= 128 && K <= 128) {
+      rewriter.replaceOpWithNewOp<mlir::cimdi::CimdiCIMSAMatmulOp>(
+          matmulOp,
+          matmulOp.getResult(0).getType(),
+          activation,       // FP16激活 
+          quantizedWeight,  // 原始量化权重
+          scaleValue,       // 缩放因子
+          zeroPointValue    // 零点
+      );
+      return mlir::success();
+    }
+
+    // 对于大矩阵，进行SA tiling
+    return performSATiling(matmulOp, rewriter, activation, quantizedWeight, 
+                          scaleValue, zeroPointValue, M, N, K);
   }
 
 private:
+  // SA tiling实现：处理大矩阵的SA量化计算
+  mlir::LogicalResult performSATiling(mlir::linalg::MatmulOp op,
+                                     mlir::PatternRewriter &rewriter,
+                                     mlir::Value activation,
+                                     mlir::Value quantizedWeight,
+                                     mlir::Value scaleValue,
+                                     mlir::Value zeroPointValue,
+                                     int64_t M, int64_t N, int64_t K) const {
+    constexpr int64_t TILE_SIZE = 128;
+    
+    mlir::Location loc = op.getLoc();
+    mlir::Value C = op.getOutputs()[0];
+    
+    // 创建常量索引
+    auto createConstIndex = [&](int64_t value) -> mlir::Value {
+      return rewriter.create<mlir::arith::ConstantIndexOp>(loc, value);
+    };
+    
+    mlir::Value c0 = createConstIndex(0);
+    mlir::Value c1 = createConstIndex(1);
+    mlir::Value tileSize = createConstIndex(TILE_SIZE);
+    mlir::Value stepM = createConstIndex(std::min(TILE_SIZE, M));
+    mlir::Value stepN = createConstIndex(std::min(TILE_SIZE, N));
+    mlir::Value stepK = createConstIndex(std::min(TILE_SIZE, K));
+    mlir::Value upperM = createConstIndex(M);
+    mlir::Value upperN = createConstIndex(N);
+    mlir::Value upperK = createConstIndex(K);
+
+    // 创建三层嵌套循环：M x N x K
+    auto outerLoop = rewriter.create<mlir::scf::ForOp>(
+        loc, c0, upperM, stepM, mlir::ValueRange{C});
+    
+    rewriter.setInsertionPointToStart(outerLoop.getBody());
+    mlir::Value i = outerLoop.getInductionVar();
+    mlir::Value currentC = outerLoop.getBody()->getArgument(1);
+    
+    auto middleLoop = rewriter.create<mlir::scf::ForOp>(
+        loc, c0, upperN, stepN, mlir::ValueRange{currentC});
+    
+    rewriter.setInsertionPointToStart(middleLoop.getBody());
+    mlir::Value j = middleLoop.getInductionVar();
+    currentC = middleLoop.getBody()->getArgument(1);
+    
+    // 对于K维度的累加，需要处理初始化
+    mlir::Value initC = currentC;
+    
+    auto innerLoop = rewriter.create<mlir::scf::ForOp>(
+        loc, c0, upperK, stepK, mlir::ValueRange{initC});
+    
+    rewriter.setInsertionPointToStart(innerLoop.getBody());
+    mlir::Value k = innerLoop.getInductionVar();
+    mlir::Value accC = innerLoop.getBody()->getArgument(1);
+    
+    // 计算当前分块的实际大小
+    mlir::Value tileSizeM = rewriter.create<mlir::arith::MinSIOp>(
+        loc, tileSize, rewriter.create<mlir::arith::SubIOp>(loc, upperM, i));
+    mlir::Value tileSizeN = rewriter.create<mlir::arith::MinSIOp>(
+        loc, tileSize, rewriter.create<mlir::arith::SubIOp>(loc, upperN, j));
+    mlir::Value tileSizeK = rewriter.create<mlir::arith::MinSIOp>(
+        loc, tileSize, rewriter.create<mlir::arith::SubIOp>(loc, upperK, k));
+    
+    // 提取子矩阵activation (A) 和 quantizedWeight (B)
+    llvm::SmallVector<mlir::OpFoldResult> offsetsA = {i, k};
+    llvm::SmallVector<mlir::OpFoldResult> sizesA = {tileSizeM, tileSizeK};
+    llvm::SmallVector<mlir::OpFoldResult> stridesA = {c1, c1};
+    
+    llvm::SmallVector<mlir::OpFoldResult> offsetsB = {k, j};
+    llvm::SmallVector<mlir::OpFoldResult> sizesB = {tileSizeK, tileSizeN};
+    llvm::SmallVector<mlir::OpFoldResult> stridesB = {c1, c1};
+    
+    mlir::Value subActivation = rewriter.create<mlir::tensor::ExtractSliceOp>(
+        loc, activation, offsetsA, sizesA, stridesA);
+    mlir::Value subQuantizedWeight = rewriter.create<mlir::tensor::ExtractSliceOp>(
+        loc, quantizedWeight, offsetsB, sizesB, stridesB);
+    
+    // 提取当前的C分块
+    llvm::SmallVector<mlir::OpFoldResult> offsetsC = {i, j};
+    llvm::SmallVector<mlir::OpFoldResult> sizesC = {tileSizeM, tileSizeN};
+    llvm::SmallVector<mlir::OpFoldResult> stridesC = {c1, c1};
+    
+    mlir::Value subC = rewriter.create<mlir::tensor::ExtractSliceOp>(
+        loc, accC, offsetsC, sizesC, stridesC);
+    
+    // 提取对应的scale和zero_point分块（如果它们不是标量）
+    mlir::Value subScale = extractParameterSlice(rewriter, loc, scaleValue, j, tileSizeN);
+    mlir::Value subZeroPoint = extractParameterSlice(rewriter, loc, zeroPointValue, j, tileSizeN);
+    
+    // 矩阵乘法累加逻辑：
+    // - K=0时: C = A*B (使用原始C作为输入，但实际上应该重置为零)
+    // - K>0时: C += A*B (使用累加的C值)
+    auto isFirstKTile = rewriter.create<mlir::arith::CmpIOp>(
+        loc, mlir::arith::CmpIPredicate::eq, k, c0);
+    
+    // 创建零张量用于第一次K迭代的初始化
+    // 使用linalg.fill创建动态大小的零张量
+    auto elementType = mlir::dyn_cast<mlir::RankedTensorType>(subC.getType()).getElementType();
+    auto zeroValue = rewriter.create<mlir::arith::ConstantOp>(
+        loc, rewriter.getZeroAttr(elementType));
+    auto zeroTensor = rewriter.create<mlir::linalg::FillOp>(
+        loc, mlir::ValueRange{zeroValue}, mlir::ValueRange{subC});
+    
+    // 第一次K迭代使用零初始化，后续使用累加值
+    auto inputC = rewriter.create<mlir::arith::SelectOp>(
+        loc, isFirstKTile, zeroTensor.getResult(0), subC);
+    
+    // 创建 CIMDi SA matmul 操作
+    auto saMatmul = rewriter.create<mlir::cimdi::CimdiCIMSAMatmulOp>(
+        loc, subC.getType(), subActivation, subQuantizedWeight, subScale, subZeroPoint);
+    
+    // 对于SA，我们需要将量化计算结果与之前的累加值相加（当K>0时）
+    mlir::Value finalResult;
+    if (K > TILE_SIZE) { // 只有当K需要分块时才需要累加
+      auto addResult = rewriter.create<mlir::arith::SelectOp>(
+          loc, isFirstKTile, saMatmul.getResult(),
+          rewriter.create<mlir::arith::AddFOp>(loc, inputC, saMatmul.getResult()));
+      finalResult = addResult;
+    } else {
+      finalResult = saMatmul.getResult();
+    }
+    
+    // 将结果插回累加矩阵
+    mlir::Value updatedAccC = rewriter.create<mlir::tensor::InsertSliceOp>(
+        loc, finalResult, accC, offsetsC, sizesC, stridesC);
+    
+    rewriter.create<mlir::scf::YieldOp>(loc, updatedAccC);
+    
+    // 设置中间循环的yield
+    rewriter.setInsertionPointAfter(innerLoop);
+    rewriter.create<mlir::scf::YieldOp>(loc, innerLoop.getResult(0));
+    
+    // 设置外层循环的yield
+    rewriter.setInsertionPointAfter(middleLoop);
+    rewriter.create<mlir::scf::YieldOp>(loc, middleLoop.getResult(0));
+    
+    // 替换原操作
+    rewriter.replaceOp(op, outerLoop.getResult(0));
+    
+    return mlir::success();
+  }
+  
+  // 辅助函数：提取scale或zero_point的对应分块
+  mlir::Value extractParameterSlice(mlir::PatternRewriter &rewriter, 
+                                   mlir::Location loc,
+                                   mlir::Value param,
+                                   mlir::Value offset,
+                                   mlir::Value size) const {
+    auto paramType = mlir::dyn_cast<mlir::RankedTensorType>(param.getType());
+    if (!paramType) {
+      // 如果是标量，直接返回
+      return param;
+    }
+    
+    auto shape = paramType.getShape();
+    if (shape.size() == 0) {
+      // 标量张量，直接返回
+      return param;
+    } else if (shape.size() == 1) {
+      // 1D张量，按列提取
+      mlir::Value c1 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
+      llvm::SmallVector<mlir::OpFoldResult> offsets = {offset};
+      llvm::SmallVector<mlir::OpFoldResult> sizes = {size};
+      llvm::SmallVector<mlir::OpFoldResult> strides = {c1};
+      
+      return rewriter.create<mlir::tensor::ExtractSliceOp>(
+          loc, param, offsets, sizes, strides);
+    } else if (shape.size() == 2) {
+      // 2D张量，按列提取 (假设是 [rows, cols] 格式)
+      mlir::Value c0 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
+      mlir::Value c1 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
+      mlir::Value fullRows = rewriter.create<mlir::arith::ConstantIndexOp>(loc, shape[0]);
+      
+      llvm::SmallVector<mlir::OpFoldResult> offsets = {c0, offset};
+      llvm::SmallVector<mlir::OpFoldResult> sizes = {fullRows, size};
+      llvm::SmallVector<mlir::OpFoldResult> strides = {c1, c1};
+      
+      return rewriter.create<mlir::tensor::ExtractSliceOp>(
+          loc, param, offsets, sizes, strides);
+    }
+    
+    // 其他情况直接返回原参数
+    return param;
+  }
+
   // 直接检查是否为常量操作（arith.constant）
   bool isDirectConstant(mlir::Value value) const {
     return value.getDefiningOp<mlir::arith::ConstantOp>() != nullptr;
@@ -383,12 +586,16 @@ private:
         loc, mlir::arith::CmpIPredicate::eq, k, c0);
     
     // 创建零张量用于第一次K迭代的初始化
-    auto zeroAttr = rewriter.getZeroAttr(subC.getType());
-    auto zeroTensor = rewriter.create<mlir::arith::ConstantOp>(loc, zeroAttr);
+    // 使用linalg.fill创建动态大小的零张量
+    auto elementType = mlir::dyn_cast<mlir::RankedTensorType>(subC.getType()).getElementType();
+    auto zeroValue = rewriter.create<mlir::arith::ConstantOp>(
+        loc, rewriter.getZeroAttr(elementType));
+    auto zeroTensor = rewriter.create<mlir::linalg::FillOp>(
+        loc, mlir::ValueRange{zeroValue}, mlir::ValueRange{subC});
     
     // 第一次K迭代使用零初始化，后续使用累加值
     auto inputC = rewriter.create<mlir::arith::SelectOp>(
-        loc, isFirstKTile, zeroTensor, subC);
+        loc, isFirstKTile, zeroTensor.getResult(0), subC);
     
     // 创建 CIMDi PE matmul 操作
     auto peMatmul = rewriter.create<mlir::cimdi::CimdiPEMatmulOp>(
