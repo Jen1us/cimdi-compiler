@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Quant/IR/Quant.h"
 
 
 // **[新添加]** 声明我们将要调用的Pass注册函数
@@ -30,6 +31,7 @@ int main(int argc, char **argv) {
   registry.insert<mlir::linalg::LinalgDialect>();
   registry.insert<mlir::tensor::TensorDialect>();
   registry.insert<mlir::memref::MemRefDialect>();
+  registry.insert<mlir::quant::QuantDialect>();
 
   // **最关键的一步: 将我们自定义的Cimdi方言注册进去**
   registry.insert<mlir::cimdi::CimdiDialect>();

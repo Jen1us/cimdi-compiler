@@ -16,6 +16,7 @@ add_mlir_conversion_library(MLIRLinalgToCimdi
   MLIRAffineDialect   # **[修复]** 正确的库名
   MLIRArithDialect    # **[修复]** 正确的库名
   MLIRFuncDialect     # **[修复]** 正确的库名
+  MLIRQuantDialect    # **[新增]** 量化dialect
 
 )
 

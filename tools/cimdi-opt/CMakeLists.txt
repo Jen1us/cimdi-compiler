@@ -15,6 +15,7 @@ target_link_libraries(cimdi-opt PRIVATE
   MLIRLinalgDialect
   MLIRTensorDialect
   MLIRMemRefDialect
+  MLIRQuantDialect
   
   # Support libraries
   MLIRSupport
